@@ -1,0 +1,247 @@
+#!/bin/bash
+#
+# auto-trim: Trimmy-style helper for Intel macOS 15 without Swift/Xcode.
+#
+# Commands:
+#   status   - Show TRIM support for attached NVMe/SATA SSDs.
+#   enable   - Run `trimforce enable` (interactive; requires sudo).
+#   disable  - Run `trimforce disable` (interactive; requires sudo).
+#
+# Example:
+#   ./auto-trim status
+#   ./auto-trim enable --dry-run
+
+set -euo pipefail
+IFS=$'\n\t'
+
+VERSION="0.1.0"
+DRY_RUN=0
+ASSUME_YES=0
+VERBOSE=0
+
+bin_trimforce="/usr/sbin/trimforce"
+bin_system_profiler="/usr/sbin/system_profiler"
+bin_sw_vers="/usr/bin/sw_vers"
+
+log() {
+  printf '[auto-trim] %s\n' "$*"
+}
+
+debug() {
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    log "$@"
+  fi
+}
+
+fail() {
+  printf 'auto-trim error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+auto-trim 0.1.0 — Trimmy-style helper for Intel macOS 15 (no Swift/Xcode)
+Usage: auto-trim [command] [options]
+
+Commands:
+  status            Show TRIM support for detected NVMe/SATA SSDs (default)
+  enable            Run `trimforce enable` (interactive; requires sudo; reboots)
+  disable           Run `trimforce disable` (interactive; requires sudo; reboots)
+
+Options:
+  --dry-run         Print the command that would run for enable/disable
+  --yes             Skip script-level prompt (trimforce still prompts)
+  -v, --verbose     Print extra debug information
+  -h, --help        Show this help text
+
+Notes:
+- This script targets Intel Macs; Apple Silicon already ships TRIM on Apple SSDs.
+- `trimforce` is Apple-provided and prompts twice; reboot is required after.
+- macOS 15 is the intended target; earlier versions should also work but are
+  not explicitly tested here.
+EOF
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+ensure_status_prereqs() {
+  [[ "$(uname -s)" == "Darwin" ]] || fail "Darwin/macOS is required."
+
+  local arch
+  arch="$(uname -m)"
+  if [[ "$arch" != "x86_64" ]]; then
+    fail "This helper is for Intel Macs; detected architecture: ${arch}"
+  fi
+
+  if [[ ! -x "$bin_system_profiler" ]]; then
+    fail "system_profiler not found at ${bin_system_profiler}."
+  fi
+
+  if [[ ! -x "$bin_sw_vers" ]]; then
+    fail "sw_vers not found at ${bin_sw_vers}."
+  fi
+}
+
+ensure_trimforce_available() {
+  if [[ ! -x "$bin_trimforce" ]]; then
+    fail "trimforce not found at ${bin_trimforce} (install Xcode Command Line Tools: xcode-select --install)."
+  fi
+}
+
+check_macos_version() {
+  local version major
+  version="$($bin_sw_vers -productVersion)"
+  major="${version%%.*}"
+  debug "macOS version detected: ${version}"
+  if [[ "$major" -lt 15 ]]; then
+    log "Warning: script is tuned for macOS 15; detected ${version}."
+  fi
+}
+
+collect_trim_status() {
+  # system_profiler is slow; keep the parsing simple to remain portable.
+  "$bin_system_profiler" SPNVMeDataType SPSerialATADataType 2>/dev/null |
+    awk '
+      /^[A-Za-z].*:$/ { device=$0; sub(/:$/, "", device); gsub(/^ */, "", device); model=""; capacity=""; }
+      /^ *Model:/ { model=$0; sub(/^ *Model: */, "", model); }
+      /^ *Device Name:/ { model=$0; sub(/^ *Device Name: */, "", model); }
+      /^ *Capacity:/ { capacity=$0; sub(/^ *Capacity: */, "", capacity); }
+      /^ *TRIM Support:/ {
+        trim=$0; sub(/^ *TRIM Support: */, "", trim);
+        label=model ? model : device;
+        printf "%s|%s|%s\n", (label?label:"(unknown)"), (capacity?capacity:""), trim;
+      }
+    '
+}
+
+print_trim_status() {
+  local lines line label capacity trim found
+  lines="$(collect_trim_status)"
+  if [[ -z "$lines" ]]; then
+    log "No SSDs with TRIM information were detected."
+    return
+  fi
+
+  printf "%-36s %-20s %s\n" "Device" "Capacity" "TRIM Support"
+  printf "%-36s %-20s %s\n" "------------------------------------" "--------------------" "------------"
+  found=0
+  while IFS= read -r line; do
+    label="${line%%|*}"
+    rest="${line#*|}"
+    capacity="${rest%%|*}"
+    trim="${line##*|}"
+    printf "%-36s %-20s %s\n" "$label" "$capacity" "$trim"
+    found=1
+  done <<<"$lines"
+
+  if [[ "$found" -eq 0 ]]; then
+    log "No TRIM status lines were parsed."
+  fi
+}
+
+trim_needed() {
+  # Returns 0 if any device reports TRIM Support: No, else 1.
+  local lines
+  lines="$(collect_trim_status)"
+  if echo "$lines" | grep -q '|No$'; then
+    return 0
+  fi
+  return 1
+}
+
+confirm() {
+  local prompt="$1"
+  if [[ "$ASSUME_YES" -eq 1 ]]; then
+    return 0
+  fi
+  printf "%s [y/N]: " "$prompt"
+  read -r reply
+  [[ "$reply" == "y" || "$reply" == "Y" ]]
+}
+
+run_trimforce() {
+  local action="$1"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "Dry run: would execute sudo ${bin_trimforce} ${action}"
+    return 0
+  fi
+  if ! confirm "Proceed to run 'sudo trimforce ${action}'? (macOS will prompt and may reboot)"; then
+    log "Cancelled."
+    exit 0
+  fi
+  log "Running trimforce (${action}); this will prompt twice and may reboot."
+  sudo "$bin_trimforce" "$action"
+}
+
+handle_status() {
+  ensure_status_prereqs
+  check_macos_version
+  print_trim_status
+}
+
+handle_enable() {
+  ensure_status_prereqs
+  ensure_trimforce_available
+  check_macos_version
+  if ! trim_needed; then
+    log "All detected SSDs already report TRIM Support: Yes."
+  fi
+  run_trimforce "enable"
+}
+
+handle_disable() {
+  ensure_status_prereqs
+  ensure_trimforce_available
+  check_macos_version
+  run_trimforce "disable"
+}
+
+parse_args() {
+  if [[ "$#" -eq 0 ]]; then
+    set -- status
+  fi
+
+  COMMAND=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      status|enable|disable)
+        COMMAND="$1"
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --yes)
+        ASSUME_YES=1
+        ;;
+      -v|--verbose)
+        VERBOSE=1
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "Unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z "${COMMAND:-}" ]]; then
+    COMMAND="status"
+  fi
+}
+
+main() {
+  parse_args "$@"
+  case "$COMMAND" in
+    status) handle_status ;;
+    enable) handle_enable ;;
+    disable) handle_disable ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
