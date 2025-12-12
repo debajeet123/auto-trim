@@ -6,10 +6,12 @@
 #   status   - Show TRIM support for attached NVMe/SATA SSDs.
 #   enable   - Run `trimforce enable` (interactive; requires sudo).
 #   disable  - Run `trimforce disable` (interactive; requires sudo).
+#   flatten  - Flatten multi-line shell snippets (Trimmy-style).
 #
 # Example:
 #   ./auto-trim status
 #   ./auto-trim enable --dry-run
+#   ./auto-trim flatten < snippet.txt
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -18,8 +20,11 @@ VERSION="0.1.0"
 DRY_RUN=0
 ASSUME_YES=0
 VERBOSE=0
+RUN_FLATTEN=0
+FLATTEN_USE_STDIN=0
 
-bin_trimforce="/usr/sbin/trimforce"
+bin_trimforce_default="/usr/sbin/trimforce"
+bin_trimforce="$bin_trimforce_default"
 bin_system_profiler="/usr/sbin/system_profiler"
 bin_sw_vers="/usr/bin/sw_vers"
 
@@ -47,10 +52,13 @@ Commands:
   status            Show TRIM support for detected NVMe/SATA SSDs (default)
   enable            Run `trimforce enable` (interactive; requires sudo; reboots)
   disable           Run `trimforce disable` (interactive; requires sudo; reboots)
+  flatten           Flatten a multi-line shell snippet to one line (reads stdin/clipboard)
 
 Options:
   --dry-run         Print the command that would run for enable/disable
   --yes             Skip script-level prompt (trimforce still prompts)
+  --run             With flatten: execute the flattened command after confirmation
+  --stdin           With flatten: read snippet from stdin instead of clipboard
   -v, --verbose     Print extra debug information
   -h, --help        Show this help text
 
@@ -85,9 +93,20 @@ ensure_status_prereqs() {
 }
 
 ensure_trimforce_available() {
-  if [[ ! -x "$bin_trimforce" ]]; then
-    fail "trimforce not found at ${bin_trimforce} (install Xcode Command Line Tools: xcode-select --install)."
+  if [[ -x "$bin_trimforce" ]]; then
+    return
   fi
+
+  # Fallback: check PATH in case trimforce is elsewhere.
+  local found
+  found="$(command -v trimforce || true)"
+  if [[ -n "$found" && -x "$found" ]]; then
+    bin_trimforce="$found"
+    debug "Found trimforce at ${bin_trimforce}"
+    return
+  fi
+
+  fail "trimforce not found (expected at ${bin_trimforce_default}); install macOS updates/Xcode Command Line Tools."
 }
 
 check_macos_version() {
@@ -198,6 +217,59 @@ handle_disable() {
   run_trimforce "disable"
 }
 
+flatten_snippet() {
+  # Flatten multi-line shell snippets so they can be pasted once and run once.
+  awk '
+    function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+    BEGIN { out=""; prev_cont=0 }
+    {
+      line=$0
+      sub(/^[[:space:]]*[$%#>]\s*/, "", line)      # strip common prompts
+      line=trim(line)
+      if (line=="") { next }
+      cont=0
+      if (line ~ /\\$/) { sub(/\\$/, "", line); line=trim(line); cont=1 }
+      else if (line ~ /&&\s*$/ || line ~ /\|\|\s*$/ || line ~ /\|\s*$/) { cont=1 }
+      if (out!="") {
+        if (prev_cont) { out=out " " line } else { out=out "; " line }
+      } else {
+        out=line
+      }
+      prev_cont=cont
+    }
+    END { if (out!="") print out }
+  '
+}
+
+handle_flatten() {
+  local input flat
+  if [[ "$FLATTEN_USE_STDIN" -eq 0 && -t 0 ]]; then
+    if command_exists pbpaste; then
+      input="$(pbpaste)"
+      [[ -n "$input" ]] || fail "Clipboard is empty; provide a snippet via stdin or --stdin."
+    else
+      fail "No stdin provided and pbpaste not available; pipe a snippet or use --stdin."
+    fi
+  else
+    input="$(cat)"
+    [[ -n "$input" ]] || fail "No input received from stdin."
+  fi
+
+  flat="$(printf '%s\n' "$input" | flatten_snippet)"
+  [[ -n "$flat" ]] || fail "Flattened command is empty."
+
+  log "Flattened command:"
+  printf '%s\n' "$flat"
+
+  if [[ "$RUN_FLATTEN" -eq 1 ]]; then
+    if confirm "Run this command now?"; then
+      eval "$flat"
+    else
+      log "Cancelled."
+    fi
+  fi
+}
+
 parse_args() {
   if [[ "$#" -eq 0 ]]; then
     set -- status
@@ -206,7 +278,7 @@ parse_args() {
   COMMAND=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
-      status|enable|disable)
+      status|enable|disable|flatten)
         COMMAND="$1"
         ;;
       --dry-run)
@@ -214,6 +286,12 @@ parse_args() {
         ;;
       --yes)
         ASSUME_YES=1
+        ;;
+      --run)
+        RUN_FLATTEN=1
+        ;;
+      --stdin)
+        FLATTEN_USE_STDIN=1
         ;;
       -v|--verbose)
         VERBOSE=1
@@ -240,6 +318,7 @@ main() {
     status) handle_status ;;
     enable) handle_enable ;;
     disable) handle_disable ;;
+    flatten) handle_flatten ;;
     *) usage; exit 1 ;;
   esac
 }
